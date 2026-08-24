@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+gunicorn
+python-multipart
+requests
+pandas
+pydantic
+tableauhyperapi
+azure-storage-blob
+
+
