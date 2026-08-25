@@ -488,7 +488,7 @@ import zipfile
 import tempfile
 import logging
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 # ============================================================
 # LOGGING
@@ -511,9 +511,9 @@ MARK_MAP = {
     'ganttbar': 'Gantt Chart',
     'shape': 'Shape Chart',
     'scatter': 'Scatter Plot',
-    'multipolygon': 'Map',
-    'filledmap': 'Map',
-    'polygon': 'Map',
+    'multipolygon': 'Filled Map',
+    'filledmap': 'Filled Map',
+    'polygon': 'Filled Map',
     'automatic': 'Standard Visual'
 }
 
@@ -526,17 +526,9 @@ DATA_TYPE_MAP = {
     "boolean": "boolean"
 }
 
-# Fields with no explicit role (plain, non-calculated columns) default to
-# dimension/measure based on their underlying data type, matching Tableau's
-# own default pill behavior.
-def default_role_for_datatype(dtype: str) -> str:
-    if dtype in ("integer", "real"):
-        return "measure"
-    return "dimension"
-
-# Quick table-calc "type" values that represent a percent-of-total calc.
-# Tableau's own attribute spelling varies by version, so we match loosely.
-PCT_TOTAL_TYPES = {"pcttotal", "percentoftotal", "percent_of_total"}
+PCT_TOTAL_INDICATORS = {
+    "pcttotal", "percentoftotal", "percent_of_total", "pcto", "percentage"
+}
 
 # ============================================================
 # UTILS & STRING CLEANERS
@@ -546,7 +538,7 @@ def strip_ns(root: ET.Element):
         if "}" in el.tag:
             el.tag = el.tag.split("}", 1)[1]
 
-def clean(val: str) -> str:
+def clean(val: Optional[str]) -> str:
     if not val:
         return ""
     return re.sub(r'[\[\]"]', "", val).strip()
@@ -563,9 +555,7 @@ def normalize_table_name(name: str) -> str:
 
 def is_junk_table(name: str) -> bool:
     name = name.lower()
-    if name.startswith("federated") or name in ["clipboard", "csv", ""]:
-        return True
-    return False
+    return name.startswith("federated") or name in ["clipboard", "csv", ""]
 
 def clean_visual_column_name(name: str) -> str:
     if not name:
@@ -576,8 +566,11 @@ def clean_visual_column_name(name: str) -> str:
     name = re.sub(r"\s*\(.*?\)", "", name)
     return name.strip()
 
+def default_role_for_datatype(dtype: str) -> str:
+    return "measure" if dtype in ("integer", "real") else "dimension"
+
 # ============================================================
-# STEP 1: HYPER METADATA (Physical Store)
+# STEP 1: HYPER METADATA
 # ============================================================
 def extract_hyper_metadata(hyper_path: str) -> Dict[str, List[Dict[str, str]]]:
     tables: Dict[str, List[Dict[str, str]]] = {}
@@ -600,7 +593,7 @@ def extract_hyper_metadata(hyper_path: str) -> Dict[str, List[Dict[str, str]]]:
                                 col_type = str(c.type).lower()
                                 mapped_type = "string"
                                 if "int" in col_type: mapped_type = "integer"
-                                elif "double" in col_type or "numeric" in col_type or "float" in col_type: mapped_type = "real"
+                                elif any(k in col_type for k in ["double", "numeric", "float"]): mapped_type = "real"
                                 elif "date" in col_type: mapped_type = "date"
                                 elif "bool" in col_type: mapped_type = "boolean"
                                 
@@ -617,7 +610,7 @@ def extract_hyper_metadata(hyper_path: str) -> Dict[str, List[Dict[str, str]]]:
     return tables
 
 # ============================================================
-# STEP 2: CALCULATED FIELDS METADATA
+# STEP 2: CALCULATIONS METADATA
 # ============================================================
 def extract_calculations(root: ET.Element) -> List[Dict[str, Any]]:
     calculations = []
@@ -635,9 +628,7 @@ def extract_calculations(root: ET.Element) -> List[Dict[str, Any]]:
             seen.add(clean_name)
 
             table_calc_node = col.find(".//table-calc")
-            table_calc_def = None
-            if table_calc_node is not None:
-                table_calc_def = {k: v for k, v in table_calc_node.attrib.items()}
+            table_calc_def = {k: v for k, v in table_calc_node.attrib.items()} if table_calc_node is not None else None
 
             calculations.append({
                 "calculationId": clean(calc_id),
@@ -736,9 +727,9 @@ def extract_relationships(root: ET.Element, valid_tables: dict, local_name_map: 
     return relationships
 
 # ============================================================
-# STEP 4: VISUAL METADATA (Full Extraction)
+# STEP 4: VISUAL DETECTION ENGINE
 # ============================================================
-def resolve_chart_subtype(
+def resolve_visual_structure(
     mark_class: str,
     rows_fields: List[Dict[str, Any]],
     cols_fields: List[Dict[str, Any]],
@@ -747,52 +738,108 @@ def resolve_chart_subtype(
     has_boxplot: bool,
     is_dual_axis: bool,
     is_combo: bool,
-) -> "str | None":
+    rows_str: str,
+    cols_str: str
+) -> Dict[str, Optional[str]]:
     """
-    Resolve a specific Tableau chart *subtype* by combining the base
-    <mark class="..."> value with where fields sit (Rows/Cols), which
-    shelf encodings (color/size/text/lod) are populated, and whether
-    table calculations (e.g. Percent of Total) or multiple panes
-    (dual-axis/combo) are present.
-
-    Subtype detection is scoped to BAR charts only. Every other mark class
-    (line, area, pie, circle/scatter/shape, square, map, text, ...) keeps
-    its plain base "visualType" from MARK_MAP with no subtype - this
-    function returns None for all of them unconditionally, regardless of
-    dual-axis/combo/donut/geo/etc. signals. Callers should only surface
-    "visualSubtype" in the output when this returns a non-null value.
+    Infers the base visual type and specific visual subtype across all Tableau mark types.
     """
-
-    if mark_class != "bar":
-        return None
-
     rows_dims = [f for f in rows_fields if f["role"] == "dimension"]
     rows_meas = [f for f in rows_fields if f["role"] == "measure"]
     cols_dims = [f for f in cols_fields if f["role"] == "dimension"]
     cols_meas = [f for f in cols_fields if f["role"] == "measure"]
 
-    color_lod_dims = [e for e in encodings if e.get("encoding") in ("color", "lod") and e.get("isDimension")]
+    color_enc = [e for e in encodings if e.get("encoding") == "color"]
+    size_enc = [e for e in encodings if e.get("encoding") == "size"]
+    has_color_dim = any(e.get("isDimension") for e in color_enc)
 
+    # 1. Single-Value Card / KPI
+    if not rows_fields and not cols_fields and any(e["role"] == "text" for e in encodings):
+        return {"visualType": "Card", "visualSubtype": "KPI Card"}
+
+    # 2. Box & Whisker Plot
+    if has_boxplot:
+        return {"visualType": "Box Plot", "visualSubtype": "Box-and-Whisker Plot"}
+
+    # 3. Combo Chart (Line + Bar, etc.)
     if is_combo:
-        return "Combo Chart (Line + Bar)"
-    if pct_total_present:
-        return "100% Stacked Bar Chart"
-    if color_lod_dims:
-        return "Stacked Bar Chart"
-    # Clustered/side-by-side: more than one dimension sharing the
-    # shelf opposite the measure (nested pills next to the measure).
-    if cols_meas and len(rows_dims) > 1:
-        return "Clustered / Side-by-Side Bar Chart"
-    if rows_meas and len(cols_dims) > 1:
-        return "Clustered / Side-by-Side Bar Chart"
-    if cols_meas and rows_dims:
-        return "Horizontal Bar Chart"
-    if rows_meas and cols_dims:
-        return "Vertical Bar Chart"
-    # Plain single-measure bar - same as the base "Bar Chart" type.
-    return None
+        return {"visualType": "Combo Chart", "visualSubtype": "Combo Chart (Line + Bar)"}
 
+    # 4. Bar Charts
+    if mark_class == "bar":
+        if pct_total_present:
+            subtype = "100% Stacked Horizontal Bar Chart" if (cols_meas and rows_dims) else "100% Stacked Bar Chart"
+            return {"visualType": "100% Stacked Bar Chart", "visualSubtype": subtype}
+        if has_color_dim:
+            subtype = "Stacked Horizontal Bar Chart" if (cols_meas and rows_dims) else "Stacked Bar Chart"
+            return {"visualType": "Bar Chart", "visualSubtype": subtype}
+        if (cols_meas and len(rows_dims) > 1) or (rows_meas and len(cols_dims) > 1):
+            return {"visualType": "Bar Chart", "visualSubtype": "Clustered / Side-by-Side Bar Chart"}
+        if cols_meas and rows_dims:
+            return {"visualType": "Bar Chart", "visualSubtype": "Horizontal Bar Chart"}
+        if rows_meas and cols_dims:
+            return {"visualType": "Bar Chart", "visualSubtype": "Vertical Bar Chart"}
+        return {"visualType": "Bar Chart", "visualSubtype": "Standard Bar Chart"}
 
+    # 5. Line Charts
+    if mark_class == "line":
+        if is_dual_axis:
+            return {"visualType": "Line Chart", "visualSubtype": "Dual Axis Line Chart"}
+        if has_color_dim:
+            return {"visualType": "Line Chart", "visualSubtype": "Multi-Line Chart"}
+        return {"visualType": "Line Chart", "visualSubtype": "Standard Line Chart"}
+
+    # 6. Area Charts
+    if mark_class == "area":
+        if pct_total_present:
+            return {"visualType": "Area Chart", "visualSubtype": "100% Stacked Area Chart"}
+        if has_color_dim:
+            return {"visualType": "Area Chart", "visualSubtype": "Stacked Area Chart"}
+        return {"visualType": "Area Chart", "visualSubtype": "Standard Area Chart"}
+
+    # 7. Pie & Donut Charts
+    if mark_class == "pie":
+        if is_dual_axis or "min(" in (rows_str + cols_str).lower():
+            return {"visualType": "Pie Chart", "visualSubtype": "Donut Chart"}
+        return {"visualType": "Pie Chart", "visualSubtype": "Standard Pie Chart"}
+
+    # 8. Square / Heatmaps / Treemaps
+    if mark_class == "square":
+        if size_enc and not rows_fields and not cols_fields:
+            return {"visualType": "Treemap", "visualSubtype": "Treemap"}
+        if rows_dims and cols_dims and color_enc:
+            return {"visualType": "Heat Map", "visualSubtype": "Highlight Table"}
+        return {"visualType": "Heat Map", "visualSubtype": "Heat Map"}
+
+    # 9. Circle / Scatter / Bubble
+    if mark_class in ["circle", "scatter"]:
+        if size_enc and not rows_fields and not cols_fields:
+            return {"visualType": "Scatter Plot", "visualSubtype": "Packed Bubble Chart"}
+        if (cols_meas and rows_meas):
+            return {"visualType": "Scatter Plot", "visualSubtype": "Scatter Plot"}
+        return {"visualType": "Scatter Plot", "visualSubtype": "Circle Mark Visual"}
+
+    # 10. Gantt / Waterfall
+    if mark_class == "ganttbar":
+        if size_enc:
+            return {"visualType": "Gantt Chart", "visualSubtype": "Waterfall Chart"}
+        return {"visualType": "Gantt Chart", "visualSubtype": "Gantt Chart"}
+
+    # 11. Maps
+    if mark_class in ["map", "multipolygon", "filledmap", "polygon"]:
+        return {"visualType": "Map", "visualSubtype": "Filled Map" if mark_class != "map" else "Symbol Map"}
+
+    # 12. Text Table / Matrix
+    if mark_class == "text":
+        return {"visualType": "Text Table", "visualSubtype": "Crosstab / Matrix Table"}
+
+    # Default fallback
+    base_type = MARK_MAP.get(mark_class, 'Standard Visual')
+    return {"visualType": base_type, "visualSubtype": None}
+
+# ============================================================
+# STEP 5: VISUAL METADATA EXTRACTION
+# ============================================================
 def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], calculations_list: List[Dict[str, Any]], column_datatypes: Dict[str, str] = None):
     worksheets_data = []
     dashboards_data = []
@@ -813,9 +860,7 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
         rows_str = ws.findtext(".//rows", default="")
         cols_str = ws.findtext(".//cols", default="")
 
-        # Determine visual mark type(s). A worksheet can have more than one
-        # <pane> (one per axis) when it's a dual-axis or combo (line+bar)
-        # view, each with its own <mark class="...">.
+        # Pane and Mark handling
         panes = ws.findall(".//pane")
         pane_marks = []
         for p in panes:
@@ -826,34 +871,23 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
         mark_class = pane_marks[0] if pane_marks else "automatic"
         distinct_pane_marks = set(pane_marks)
 
-        # Multiple panes sharing one mark type => dual-axis; multiple panes
-        # with different mark types (e.g. Line + Bar) => combo chart. As a
-        # secondary signal, a shelf whose expression combines two aggregate
-        # fields with "+" (e.g. "SUM(Sales)+SUM(Profit)") also indicates a
-        # dual-axis layout even when only one <pane> node is present.
-        dual_axis_shelf_hint = bool(re.search(r'\)\s*\+\s*\w+\(', rows_str)) or bool(
-            re.search(r'\)\s*\+\s*\w+\(', cols_str)
-        )
+        dual_axis_shelf_hint = bool(re.search(r'\)\s*\+\s*\w+\(', rows_str)) or bool(re.search(r'\)\s*\+\s*\w+\(', cols_str))
         is_combo = len(panes) > 1 and len(distinct_pane_marks) > 1
-        is_dual_axis = (len(panes) > 1 and len(distinct_pane_marks) <= 1) or (
-            dual_axis_shelf_hint and not is_combo
+        is_dual_axis = (len(panes) > 1 and len(distinct_pane_marks) <= 1) or (dual_axis_shelf_hint and not is_combo)
+
+        # Box plot detection
+        has_boxplot = any(
+            "box" in str(v).lower()
+            for ref in ws.findall(".//reference-line") + ws.findall(".//reference-band") + ws.findall(".//statistic")
+            for v in ref.attrib.values()
         )
 
-        # A box-and-whisker plot isn't its own mark type in Tableau - it's a
-        # <reference-line>/<reference-band> or <statistic> overlay (often on
-        # top of a circle/bar mark) whose type/scope mentions "box".
-        has_boxplot = False
-        for ref in ws.findall(".//reference-line") + ws.findall(".//reference-band") + ws.findall(".//statistic"):
-            if any("box" in str(v).lower() for v in ref.attrib.values()):
-                has_boxplot = True
-                break
-
-        # Columns, Encoded Fields, Filters, and Table Calculations
         fields = []
         encodings = []
         filters = []
         table_calcs = []
         columns_ref = []
+        pct_from_derivations = False
 
         # 1. Dependency Analysis
         for dep in ws.findall(".//datasource-dependencies"):
@@ -864,14 +898,15 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
                 derivation = col_inst.get("derivation", "None")
                 inst_type = col_inst.get("type", "nominal")
                 
-                # Calculation resolution
+                if derivation.lower() in PCT_TOTAL_INDICATORS or inst_name.lower().startswith("pcto:"):
+                    pct_from_derivations = True
+
                 calc_meta = calc_lookup.get(clean(raw_col)) or calc_name_lookup.get(clean_col)
                 is_calc = calc_meta is not None
                 
                 field_role = "dimension" if inst_type in ["nominal", "ordinal"] else "measure"
                 field_table = None if is_calc else column_to_table.get(clean_col, "Unknown")
                 
-                # Check shelf presence
                 shelf_location = "Marks"
                 if inst_name in rows_str: shelf_location = "Rows"
                 elif inst_name in cols_str: shelf_location = "Columns"
@@ -895,18 +930,6 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
                     if calc_meta.get("defaultFormat"):
                         field_obj["defaultFormat"] = calc_meta["defaultFormat"]
 
-                fields.append(field_obj)
-                columns_ref.append({
-                    "table": field_table,
-                    "column": field_obj["name"],
-                    "fieldType": field_obj["fieldType"],
-                    "calculationId": field_obj.get("calculationId")
-                })
-
-                # Table calc defs (e.g. Quick Table Calc "Percent of Total")
-                # travel with the calculated field itself, so surface them
-                # here against the shelf they're placed on.
-                if is_calc:
                     tcd = calc_meta.get("tableCalculationDefinition")
                     if tcd:
                         table_calcs.append({
@@ -915,8 +938,17 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
                             "definition": tcd
                         })
 
-        pct_total_present = any(
-            str(tc["definition"].get("type", "")).replace("_", "").replace("-", "").lower() in PCT_TOTAL_TYPES
+                fields.append(field_obj)
+                columns_ref.append({
+                    "table": field_table,
+                    "column": field_obj["name"],
+                    "fieldType": field_obj["fieldType"],
+                    "calculationId": field_obj.get("calculationId")
+                })
+
+        # Table calculation checking
+        pct_total_present = pct_from_derivations or any(
+            str(tc["definition"].get("type", "")).replace("_", "").replace("-", "").lower() in PCT_TOTAL_INDICATORS
             for tc in table_calcs
         )
 
@@ -963,35 +995,24 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
         rows_fields = [f for f in fields if f["shelf"] == "Rows"]
         cols_fields = [f for f in fields if f["shelf"] == "Columns"]
 
-        # A worksheet with no shelves at all and only a text encoding is a
-        # single-value Card, regardless of its (usually "automatic") mark.
-        # "visualType" is always the base Tableau mark type (Bar Chart,
-        # Line Chart, Map, ...). "visualSubtype" is only populated when the
-        # shelf/encoding combination represents a distinct variant that
-        # actually changes how the visual needs to be rebuilt in the
-        # migration target (stacked/clustered bars, dual-axis/combo lines,
-        # donut, treemap, bubble, filled/symbol map, box-and-whisker,
-        # etc.) - it stays None for plain/default visuals.
-        if len(cols_str) == 0 and len(rows_str) == 0 and any(e["role"] == "text" for e in encodings) and not rows_fields and not cols_fields:
-            visual_type = "Card"
-            visual_subtype = None
-        else:
-            visual_type = MARK_MAP.get(mark_class, "Standard Visual")
-            visual_subtype = resolve_chart_subtype(
-                mark_class=mark_class,
-                rows_fields=rows_fields,
-                cols_fields=cols_fields,
-                encodings=encodings,
-                pct_total_present=pct_total_present,
-                has_boxplot=has_boxplot,
-                is_dual_axis=is_dual_axis,
-                is_combo=is_combo,
-            )
+        # Resolve Visual Type and Subtype
+        structure = resolve_visual_structure(
+            mark_class=mark_class,
+            rows_fields=rows_fields,
+            cols_fields=cols_fields,
+            encodings=encodings,
+            pct_total_present=pct_total_present,
+            has_boxplot=has_boxplot,
+            is_dual_axis=is_dual_axis,
+            is_combo=is_combo,
+            rows_str=rows_str,
+            cols_str=cols_str
+        )
 
         worksheets_data.append({
             "name": sheet_name,
-            "visualType": visual_type,
-            "visualSubtype": visual_subtype,
+            "visualType": structure["visualType"],
+            "visualSubtype": structure["visualSubtype"],
             "title": {
                 "text": raw_title,
                 "displayText": display_title,
@@ -1080,7 +1101,6 @@ def extract_metadata_from_twbx(twbx_path: str):
         hyper_tables = extract_hyper_metadata(hyper) if hyper else {}
 
         final_tables = {}
-        # Merge XML + Hyper
         for t, cols in xml_tables.items():
             if not is_junk_table(t):
                 final_tables[t] = cols
