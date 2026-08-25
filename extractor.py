@@ -751,13 +751,23 @@ def resolve_chart_subtype(
     has_boxplot: bool,
     is_dual_axis: bool,
     is_combo: bool,
-) -> str:
+) -> "str | None":
     """
-    Resolve a specific Tableau chart subtype by combining the base
+    Resolve a specific Tableau chart *subtype* by combining the base
     <mark class="..."> value with where fields sit (Rows/Cols), which
     shelf encodings (color/size/text/lod) are populated, and whether
     table calculations (e.g. Percent of Total) or multiple panes
     (dual-axis/combo) are present.
+
+    This is intentionally separate from the base "visualType" (which is
+    just MARK_MAP[mark_class]). It returns None when the worksheet is a
+    plain/default rendering of its mark class with nothing extra worth
+    surfacing - only worksheets whose shelf/encoding combination changes
+    how the visual needs to be rebuilt in Power BI (stacked vs. clustered
+    bars, dual-axis vs. combo lines, donut vs. pie, filled vs. symbol map,
+    treemap vs. heatmap, bubble vs. scatter, box-and-whisker overlays,
+    etc.) get a non-null subtype. Callers should only surface
+    "visualSubtype" in the output when this returns a value.
     """
 
     def is_continuous(f: Dict[str, Any]) -> bool:
@@ -800,7 +810,9 @@ def resolve_chart_subtype(
     if mark_class in ("multipolygon", "polygon", "filledmap"):
         return "Filled Map"
     if mark_class == "map":
-        return "Map"
+        # Plain map mark - identical to the base "Map" visualType, so no
+        # extra subtype is needed.
+        return None
 
     if mark_class == "bar":
         if is_combo:
@@ -819,7 +831,8 @@ def resolve_chart_subtype(
             return "Horizontal Bar Chart"
         if rows_meas and cols_dims:
             return "Vertical Bar Chart"
-        return "Bar Chart"
+        # Plain single-measure bar - same as the base "Bar Chart" type.
+        return None
 
     if mark_class == "line":
         if is_combo:
@@ -830,47 +843,51 @@ def resolve_chart_subtype(
             return "Multi-Line Chart"
         if any(is_continuous(f) and is_date_type(f) for f in rows_fields + cols_fields):
             return "Trend Line / Time Series Line"
-        return "Line Chart"
+        # Plain single-series line - same as the base "Line Chart" type.
+        return None
 
     if mark_class == "area":
         if pct_total_present:
             return "100% Stacked Area Chart"
         if color_lod_dims:
             return "Stacked Area Chart"
-        return "Area Chart"
+        # Plain single-series area - same as the base "Area Chart" type.
+        return None
 
     if mark_class in ("circle", "shape", "scatter"):
         cols_meas_cont = [f for f in cols_meas if is_continuous(f)]
         rows_meas_cont = [f for f in rows_meas if is_continuous(f)]
-        if cols_meas_cont and rows_meas_cont:
-            if size_encodings:
-                return "Bubble Chart"
-            return "Scatter Plot"
-        return "Shape Chart" if mark_class == "shape" else "Scatter Plot"
+        if cols_meas_cont and rows_meas_cont and size_encodings:
+            return "Bubble Chart"
+        # Plain scatter/shape mark - same as the base type (Scatter Plot /
+        # Shape Chart), no extra subtype needed.
+        return None
 
     if mark_class == "square":
         if size_meas and color_meas:
             return "Treemap"
         if color_meas:
             return "Heatmap (Highlight Table)"
-        return "Heat Map"
+        # Plain square mark - same as the base "Heat Map" type.
+        return None
 
     if mark_class in ("text", "automatic"):
         if color_meas:
             return "Heatmap (Highlight Table)"
-        return "Crosstab / Text Table"
+        # Plain text/crosstab - same as the base type, no subtype needed.
+        return None
 
     if mark_class == "pie":
         # A pie built as a donut is authored as a dual-axis/second-pane
         # view (a plain white "hole" circle overlaid on the pie axis).
         if is_dual_axis or is_combo:
             return "Donut Chart"
-        return "Pie Chart"
+        # Plain pie - same as the base "Pie Chart" type.
+        return None
 
-    if mark_class == "ganttbar":
-        return "Gantt Chart"
-
-    return MARK_MAP.get(mark_class, "Standard Visual")
+    # Gantt bars and any other mark classes have no finer-grained subtype
+    # distinction beyond MARK_MAP's base visualType.
+    return None
 
 
 def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], calculations_list: List[Dict[str, Any]], column_datatypes: Dict[str, str] = None):
@@ -1045,10 +1062,19 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
 
         # A worksheet with no shelves at all and only a text encoding is a
         # single-value Card, regardless of its (usually "automatic") mark.
+        # "visualType" is always the base Tableau mark type (Bar Chart,
+        # Line Chart, Map, ...). "visualSubtype" is only populated when the
+        # shelf/encoding combination represents a distinct variant that
+        # actually changes how the visual needs to be rebuilt in the
+        # migration target (stacked/clustered bars, dual-axis/combo lines,
+        # donut, treemap, bubble, filled/symbol map, box-and-whisker,
+        # etc.) - it stays None for plain/default visuals.
         if len(cols_str) == 0 and len(rows_str) == 0 and any(e["role"] == "text" for e in encodings) and not rows_fields and not cols_fields:
             visual_type = "Card"
+            visual_subtype = None
         else:
-            visual_type = resolve_chart_subtype(
+            visual_type = MARK_MAP.get(mark_class, "Standard Visual")
+            visual_subtype = resolve_chart_subtype(
                 mark_class=mark_class,
                 rows_fields=rows_fields,
                 cols_fields=cols_fields,
@@ -1062,6 +1088,7 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
         worksheets_data.append({
             "name": sheet_name,
             "visualType": visual_type,
+            "visualSubtype": visual_subtype,
             "title": {
                 "text": raw_title,
                 "displayText": display_title,
