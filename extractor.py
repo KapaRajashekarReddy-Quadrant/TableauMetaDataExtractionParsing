@@ -1,496 +1,12 @@
-# import os
-# import re
-# import zipfile
-# import tempfile
-# import logging
-# import xml.etree.ElementTree as ET
-# from typing import Dict, List, Any
-
-# ============================================================
-# # LOGGING
-# # ============================================================
-# logging.basicConfig(level=logging.INFO)
-# log = logging.getLogger("tableau-metadata")
-
-# # ============================================================
-# # CONSTANTS & MAPPINGS
-# # ============================================================
-# MARK_MAP = {
-#     'bar': 'Bar Chart',
-#     'line': 'Line Chart',
-#     'area': 'Area Chart',
-#     'text': 'Text Table',
-#     'circle': 'Scatter Plot',
-#     'square': 'Heat Map',
-#     'pie': 'Pie Chart',
-#     'map': 'Map',
-#     'ganttbar': 'Gantt Chart',
-#     'shape': 'Shape Chart',
-#     'scatter': 'Scatter Plot',
-#     'multipolygon': 'Map',
-#     'filledmap': 'Map',
-#     'polygon': 'Map',
-#     'automatic': 'Standard Visual'
-# }
-
-# DATA_TYPE_MAP = {
-#     "integer": "integer",
-#     "real": "real",
-#     "string": "string",
-#     "date": "date",
-#     "datetime": "datetime",
-#     "boolean": "boolean"
-# }
-
-# # ============================================================
-# # UTILS & STRING CLEANERS
-# # ============================================================
-# def strip_ns(root: ET.Element):
-#     for el in root.iter():
-#         if "}" in el.tag:
-#             el.tag = el.tag.split("}", 1)[1]
-
-# def clean(val: str) -> str:
-#     if not val:
-#         return ""
-#     return re.sub(r'[\[\]"]', "", val).strip()
-
-# def normalize_table_name(name: str) -> str:
-#     name = clean(name)
-#     name = re.sub(r"\s*\(.*?\)", "", name)
-#     name = re.sub(r"[_\-]?[0-9a-fA-F]{32}", "", name)
-#     name = re.sub(r"\.(csv|txt|xlsx|xls|hyper|tde)", "", name, flags=re.IGNORECASE)
-#     name = re.sub(r'^Extract[_\s]?', '', name, flags=re.IGNORECASE)
-#     name = name.split("#")[0]
-#     name = re.sub(r"[^a-zA-Z0-9 _-]", "", name).strip()
-#     return name
-
-# def is_junk_table(name: str) -> bool:
-#     name = name.lower()
-#     if name.startswith("federated") or name in ["clipboard", "csv", ""]:
-#         return True
-#     return False
-
-# def clean_visual_column_name(name: str) -> str:
-#     if not name:
-#         return ""
-#     name = name.replace("[", "").replace("]", "")
-#     name = re.sub(r'^(none|sum|avg|min|max|count|attr|yr|mn|dy|qd|tdc|usr|pcto|rank):', '', name, flags=re.IGNORECASE)
-#     name = re.sub(r':(nk|ok|qk|sk)(:\d+)?$', '', name, flags=re.IGNORECASE)
-#     name = re.sub(r"\s*\(.*?\)", "", name)
-#     return name.strip()
-
-# # ============================================================
-# # STEP 1: HYPER METADATA (Physical Store)
-# # ============================================================
-# def extract_hyper_metadata(hyper_path: str) -> Dict[str, List[Dict[str, str]]]:
-#     tables: Dict[str, List[Dict[str, str]]] = {}
-#     if not hyper_path or not os.path.exists(hyper_path):
-#         return tables
-
-#     try:
-#         from tableauhyperapi import HyperProcess, Telemetry, Connection
-#         with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-#             with Connection(hyper.endpoint, hyper_path) as conn:
-#                 for schema in conn.catalog.get_schema_names():
-#                     for table in conn.catalog.get_table_names(schema):
-#                         table_name = normalize_table_name(str(table.name))
-#                         if is_junk_table(table_name):
-#                             continue
-#                         cols = []
-#                         try:
-#                             table_def = conn.catalog.get_table_definition(table)
-#                             for c in table_def.columns:
-#                                 col_type = str(c.type).lower()
-#                                 mapped_type = "string"
-#                                 if "int" in col_type: mapped_type = "integer"
-#                                 elif "double" in col_type or "numeric" in col_type or "float" in col_type: mapped_type = "real"
-#                                 elif "date" in col_type: mapped_type = "date"
-#                                 elif "bool" in col_type: mapped_type = "boolean"
-                                
-#                                 cols.append({
-#                                     "name": clean(str(c.name)),
-#                                     "dataType": mapped_type
-#                                 })
-#                         except Exception:
-#                             pass
-#                         if cols:
-#                             tables[table_name] = cols
-#     except Exception as e:
-#         log.warning(f"Hyper extraction skipped or failed: {e}")
-#     return tables
-
-# # ============================================================
-# # STEP 2: CALCULATED FIELDS METADATA
-# # ============================================================
-# def extract_calculations(root: ET.Element) -> List[Dict[str, Any]]:
-#     calculations = []
-#     seen = set()
-
-#     for col in root.findall(".//column"):
-#         calc = col.find("calculation")
-#         caption = col.get("caption") or col.get("name")
-#         calc_id = col.get("name", "")
-        
-#         if calc is not None and "formula" in calc.attrib:
-#             clean_name = clean(caption)
-#             if clean_name in seen:
-#                 continue
-#             seen.add(clean_name)
-
-#             table_calc_node = col.find(".//table-calc")
-#             table_calc_def = None
-#             if table_calc_node is not None:
-#                 table_calc_def = {k: v for k, v in table_calc_node.attrib.items()}
-
-#             calculations.append({
-#                 "calculationId": clean(calc_id),
-#                 "name": clean_name,
-#                 "fieldType": "calculatedField",
-#                 "role": col.get("role", "measure"),
-#                 "table": None,
-#                 "dataType": DATA_TYPE_MAP.get(col.get("datatype", "real"), col.get("datatype", "real")),
-#                 "formula": calc.get("formula"),
-#                 "defaultFormat": col.get("default-format"),
-#                 "tableCalculationDefinition": table_calc_def
-#             })
-#     return calculations
-
-# # ============================================================
-# # STEP 3: XML METADATA & RELATIONSHIPS
-# # ============================================================
-# def extract_xml_metadata(root: ET.Element):
-#     xml_tables: Dict[str, List[Dict[str, str]]] = {}
-#     local_name_map: Dict[str, dict] = {}
-
-#     for record in root.findall(".//metadata-record[@class='column']"):
-#         remote_name = record.find("remote-name")
-#         parent_name = record.find("parent-name")
-#         local_name_node = record.find("local-name")
-#         type_node = record.find("local-type")
-
-#         if remote_name is not None and parent_name is not None:
-#             col = clean(remote_name.text)
-#             clean_tbl = normalize_table_name(parent_name.text)
-#             raw_type = type_node.text if type_node is not None else "string"
-#             datatype = DATA_TYPE_MAP.get(raw_type, raw_type)
-
-#             if not is_junk_table(clean_tbl):
-#                 xml_tables.setdefault(clean_tbl, [])
-#                 if not any(c["name"] == col for c in xml_tables[clean_tbl]):
-#                     xml_tables[clean_tbl].append({"name": col, "dataType": datatype})
-
-#                 if local_name_node is not None and local_name_node.text:
-#                     raw_local = local_name_node.text
-#                     info = {"table": clean_tbl, "col": col, "dataType": datatype}
-#                     local_name_map[raw_local] = info
-#                     local_name_map[clean(raw_local)] = info
-
-#     for relation in root.findall(".//relation[@type='table']"):
-#         t_name = relation.get("name") or relation.get("table") or "Unknown"
-#         clean_tbl = normalize_table_name(t_name)
-#         if not is_junk_table(clean_tbl):
-#             xml_tables.setdefault(clean_tbl, [])
-#             for col in relation.findall(".//column"):
-#                 col_name = clean(col.get("name"))
-#                 col_type = col.get("datatype", "string")
-#                 if col_name and not any(c["name"] == col_name for c in xml_tables[clean_tbl]):
-#                     xml_tables[clean_tbl].append({
-#                         "name": col_name,
-#                         "dataType": DATA_TYPE_MAP.get(col_type, col_type)
-#                     })
-
-#     return xml_tables, local_name_map
-
-# def extract_relationships(root: ET.Element, valid_tables: dict, local_name_map: dict):
-#     relationships = []
-#     seen = set()
-#     valid_names = set(valid_tables.keys())
-
-#     def add(from_t, from_c, to_t, to_c):
-#         from_t = normalize_table_name(from_t)
-#         to_t = normalize_table_name(to_t)
-#         if from_t not in valid_names or to_t not in valid_names or from_t == to_t:
-#             return
-#         key = (from_t, from_c, to_t, to_c)
-#         if key in seen:
-#             return
-#         seen.add(key)
-#         relationships.append({
-#             "fromTable": from_t,
-#             "fromColumn": from_c,
-#             "toTable": to_t,
-#             "toColumn": to_c,
-#             "relationshipType": "Many-to-One"
-#         })
-
-#     for rel in root.findall(".//clause[@type='join']") + root.findall(".//relationship"):
-#         expr = rel.find("expression") or rel
-#         ops = []
-#         for sub in expr.iter("expression"):
-#             op = sub.get("op")
-#             if op and (op.startswith("[") or op in local_name_map):
-#                 ops.append(op)
-#         if len(ops) == 2:
-#             info1 = local_name_map.get(ops[0]) or local_name_map.get(clean(ops[0]))
-#             info2 = local_name_map.get(ops[1]) or local_name_map.get(clean(ops[1]))
-#             if info1 and info2:
-#                 add(info1['table'], info1['col'], info2['table'], info2['col'])
-
-#     return relationships
-
-# # ============================================================
-# # STEP 4: VISUAL METADATA (Full Extraction)
-# # ============================================================
-# def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], calculations_list: List[Dict[str, Any]]):
-#     worksheets_data = []
-#     dashboards_data = []
-#     calc_lookup = {c["calculationId"]: c for c in calculations_list}
-#     calc_name_lookup = {c["name"]: c for c in calculations_list}
-
-#     # --- A. Worksheets Extraction ---
-#     for ws in root.findall(".//worksheet"):
-#         sheet_name = ws.get('name')
-        
-#         # Title logic
-#         title_run = ws.find(".//title/formatted-text/run")
-#         raw_title = title_run.text if (title_run is not None and title_run.text) else "<Sheet Name>"
-#         display_title = sheet_name if "<Sheet Name>" in raw_title else raw_title.replace("\n", " ").strip()
-
-#         # Shelves raw strings
-#         rows_str = ws.findtext(".//rows", default="")
-#         cols_str = ws.findtext(".//cols", default="")
-
-#         # Determine visual mark type
-#         mark_elem = ws.find(".//pane/mark")
-#         mark_class = mark_elem.get('class', 'automatic').lower() if mark_elem is not None else 'automatic'
-#         visual_type = MARK_MAP.get(mark_class, 'Bar Chart')
-
-#         # Columns, Encoded Fields, Filters, and Table Calculations
-#         fields = []
-#         encodings = []
-#         filters = []
-#         table_calcs = []
-#         columns_ref = []
-
-#         # 1. Dependency Analysis
-#         for dep in ws.findall(".//datasource-dependencies"):
-#             for col_inst in dep.findall("column-instance"):
-#                 inst_name = col_inst.get("name", "")
-#                 raw_col = col_inst.get("column", "")
-#                 clean_col = clean_visual_column_name(raw_col) or clean_visual_column_name(inst_name)
-#                 derivation = col_inst.get("derivation", "None")
-#                 inst_type = col_inst.get("type", "nominal")
-                
-#                 # Calculation resolution
-#                 calc_meta = calc_lookup.get(clean(raw_col)) or calc_name_lookup.get(clean_col)
-#                 is_calc = calc_meta is not None
-                
-#                 field_role = "dimension" if inst_type in ["nominal", "ordinal"] else "measure"
-#                 field_table = None if is_calc else column_to_table.get(clean_col, "Unknown")
-                
-#                 # Check shelf presence
-#                 shelf_location = "Marks"
-#                 if inst_name in rows_str: shelf_location = "Rows"
-#                 elif inst_name in cols_str: shelf_location = "Columns"
-
-#                 field_obj = {
-#                     "fieldType": "calculatedField" if is_calc else "column",
-#                     "role": field_role,
-#                     "table": field_table,
-#                     "column": clean_col,
-#                     "dataType": calc_meta["dataType"] if is_calc else "string",
-#                     "name": calc_meta["name"] if is_calc else clean_col,
-#                     "instanceName": inst_name,
-#                     "derivation": derivation,
-#                     "instanceType": inst_type,
-#                     "shelf": shelf_location
-#                 }
-
-#                 if is_calc:
-#                     field_obj["calculationId"] = calc_meta["calculationId"]
-#                     field_obj["formula"] = calc_meta["formula"]
-#                     if calc_meta.get("defaultFormat"):
-#                         field_obj["defaultFormat"] = calc_meta["defaultFormat"]
-
-#                 fields.append(field_obj)
-#                 columns_ref.append({
-#                     "table": field_table,
-#                     "column": field_obj["name"],
-#                     "fieldType": field_obj["fieldType"],
-#                     "calculationId": field_obj.get("calculationId")
-#                 })
-
-#         # 2. Panes & Encodings
-#         for pane in ws.findall(".//pane"):
-#             for role_tag in ["color", "size", "tooltip", "text", "lod", "wedge-size"]:
-#                 for el in pane.findall(f".//{role_tag}"):
-#                     col_ref = el.get("column", "")
-#                     clean_c = clean_visual_column_name(col_ref)
-#                     calc_m = calc_lookup.get(clean(col_ref)) or calc_name_lookup.get(clean_c)
-
-#                     enc_obj = {
-#                         "name": calc_m["name"] if calc_m else clean_c,
-#                         "role": role_tag,
-#                         "encoding": role_tag,
-#                         "fieldType": "calculatedField" if calc_m else "column",
-#                         "table": None if calc_m else column_to_table.get(clean_c, "Unknown"),
-#                         "instanceName": col_ref
-#                     }
-#                     if calc_m:
-#                         enc_obj["calculationId"] = calc_m["calculationId"]
-#                         enc_obj["dataType"] = calc_m["dataType"]
-#                         enc_obj["formula"] = calc_m["formula"]
-#                     encodings.append(enc_obj)
-
-#         # 3. Filters
-#         for flt in ws.findall(".//filter"):
-#             flt_col = flt.get("column", "")
-#             clean_flt = clean_visual_column_name(flt_col)
-#             calc_m = calc_lookup.get(clean(flt_col)) or calc_name_lookup.get(clean_flt)
-            
-#             filters.append({
-#                 "name": calc_m["name"] if calc_m else clean_flt,
-#                 "column": clean_flt,
-#                 "fieldType": "calculatedField" if calc_m else "column",
-#                 "filterClass": flt.get("class", "categorical"),
-#                 "instanceName": flt_col
-#             })
-
-#         # Fallback card type detection
-#         if visual_type == "Standard Visual":
-#             if len(cols_str) == 0 and len(rows_str) == 0 and any(e["role"] == "text" for e in encodings):
-#                 visual_type = "Card"
-#             else:
-#                 visual_type = "Bar Chart"
-
-#         worksheets_data.append({
-#             "name": sheet_name,
-#             "visualType": visual_type,
-#             "title": {
-#                 "text": raw_title,
-#                 "displayText": display_title,
-#                 "isDynamic": "<Sheet Name>" in raw_title,
-#                 "source": "tableau_worksheet_title"
-#             },
-#             "columns": columns_ref,
-#             "fields": fields,
-#             "rows": [f for f in fields if f["shelf"] == "Rows"],
-#             "columnsShelf": [f for f in fields if f["shelf"] == "Columns"],
-#             "encodings": encodings,
-#             "filters": filters,
-#             "tableCalculations": table_calcs
-#         })
-
-#     # --- B. Dashboards & Geometry Normalization ---
-#     for db in root.findall(".//dashboard"):
-#         db_name = db.get("name", "Dashboard")
-#         size_node = db.find(".//size")
-#         cw = int(size_node.get("maxwidth", 1000)) if size_node is not None else 1000
-#         ch = int(size_node.get("maxheight", 800)) if size_node is not None else 800
-
-#         ws_list = []
-#         visuals = []
-
-#         for zone in db.findall(".//zone[@name]"):
-#             z_name = zone.get("name")
-#             ws_list.append(z_name)
-
-#             raw_x = float(zone.get("x", 0))
-#             raw_y = float(zone.get("y", 0))
-#             raw_w = float(zone.get("w", 0))
-#             raw_h = float(zone.get("h", 0))
-
-#             visuals.append({
-#                 "name": z_name,
-#                 "x": raw_x,
-#                 "y": raw_y,
-#                 "width": raw_w,
-#                 "height": raw_h,
-#                 "pixel_layout": {
-#                     "pixel_x": round((raw_x / 100000.0) * cw, 2),
-#                     "pixel_y": round((raw_y / 100000.0) * ch, 2),
-#                     "pixel_width": round((raw_w / 100000.0) * cw, 2),
-#                     "pixel_height": round((raw_h / 100000.0) * ch, 2)
-#                 }
-#             })
-
-#         dashboards_data.append({
-#             "dashboardName": db_name,
-#             "worksheets": ws_list,
-#             "canvas": {"width": cw, "height": ch},
-#             "visuals": visuals,
-#             "coordinateSystem": "tableau_0_100000"
-#         })
-
-#     return worksheets_data, dashboards_data
-
-# # ============================================================
-# # MASTER ENTRY POINT
-# # ============================================================
-# def extract_metadata_from_twbx(twbx_path: str):
-#     log.info(f"Extracting Tableau file: {twbx_path}")
-#     with tempfile.TemporaryDirectory() as tmp:
-#         with zipfile.ZipFile(twbx_path, "r") as z:
-#             z.extractall(tmp)
-
-#         twb = hyper = None
-#         for root_dir, _, files in os.walk(tmp):
-#             for f in files:
-#                 if f.endswith(".twb"): twb = os.path.join(root_dir, f)
-#                 elif f.endswith(".hyper"): hyper = os.path.join(root_dir, f)
-
-#         if not twb:
-#             raise ValueError("Invalid package: .twb not found inside archive")
-
-#         tree = ET.parse(twb)
-#         root = tree.getroot()
-#         strip_ns(root)
-
-#         # 1. Calculations
-#         calculations = extract_calculations(root)
-
-#         # 2. Tables & Physical Schema
-#         xml_tables, local_name_map = extract_xml_metadata(root)
-#         hyper_tables = extract_hyper_metadata(hyper) if hyper else {}
-
-#         final_tables = {}
-#         # Merge XML + Hyper
-#         for t, cols in xml_tables.items():
-#             if not is_junk_table(t):
-#                 final_tables[t] = cols
-#         for t, cols in hyper_tables.items():
-#             if not is_junk_table(t) and t not in final_tables:
-#                 final_tables[t] = cols
-
-#         # 3. Relationships
-#         relationships = extract_relationships(root, final_tables, local_name_map)
-
-#         # 4. Inverted Column-to-Table Map
-#         column_to_table = {}
-#         for tbl, cols in final_tables.items():
-#             for c in cols:
-#                 column_to_table[c["name"]] = tbl
-
-#         # 5. Worksheets & Dashboards
-#         worksheets, dashboards = extract_visual_metadata(root, column_to_table, calculations)
-
-#         return {
-#             "tables": final_tables,
-#             "relationships": relationships,
-#             "calculations": calculations,
-#             "worksheets": worksheets,
-#             "dashboards": dashboards
-#         }
 import os
 import re
 import zipfile
 import tempfile
 import logging
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 
-# ============================================================
+============================================================
 # LOGGING
 # ============================================================
 logging.basicConfig(level=logging.INFO)
@@ -511,9 +27,9 @@ MARK_MAP = {
     'ganttbar': 'Gantt Chart',
     'shape': 'Shape Chart',
     'scatter': 'Scatter Plot',
-    'multipolygon': 'Filled Map',
-    'filledmap': 'Filled Map',
-    'polygon': 'Filled Map',
+    'multipolygon': 'Map',
+    'filledmap': 'Map',
+    'polygon': 'Map',
     'automatic': 'Standard Visual'
 }
 
@@ -526,10 +42,6 @@ DATA_TYPE_MAP = {
     "boolean": "boolean"
 }
 
-PCT_TOTAL_INDICATORS = {
-    "pcttotal", "percentoftotal", "percent_of_total", "pcto", "percentage"
-}
-
 # ============================================================
 # UTILS & STRING CLEANERS
 # ============================================================
@@ -538,7 +50,7 @@ def strip_ns(root: ET.Element):
         if "}" in el.tag:
             el.tag = el.tag.split("}", 1)[1]
 
-def clean(val: Optional[str]) -> str:
+def clean(val: str) -> str:
     if not val:
         return ""
     return re.sub(r'[\[\]"]', "", val).strip()
@@ -555,7 +67,9 @@ def normalize_table_name(name: str) -> str:
 
 def is_junk_table(name: str) -> bool:
     name = name.lower()
-    return name.startswith("federated") or name in ["clipboard", "csv", ""]
+    if name.startswith("federated") or name in ["clipboard", "csv", ""]:
+        return True
+    return False
 
 def clean_visual_column_name(name: str) -> str:
     if not name:
@@ -565,9 +79,6 @@ def clean_visual_column_name(name: str) -> str:
     name = re.sub(r':(nk|ok|qk|sk)(:\d+)?$', '', name, flags=re.IGNORECASE)
     name = re.sub(r"\s*\(.*?\)", "", name)
     return name.strip()
-
-def default_role_for_datatype(dtype: str) -> str:
-    return "measure" if dtype in ("integer", "real") else "dimension"
 
 # ============================================================
 # STEP 1: HYPER METADATA (Physical Store)
@@ -593,7 +104,7 @@ def extract_hyper_metadata(hyper_path: str) -> Dict[str, List[Dict[str, str]]]:
                                 col_type = str(c.type).lower()
                                 mapped_type = "string"
                                 if "int" in col_type: mapped_type = "integer"
-                                elif any(k in col_type for k in ["double", "numeric", "float"]): mapped_type = "real"
+                                elif "double" in col_type or "numeric" in col_type or "float" in col_type: mapped_type = "real"
                                 elif "date" in col_type: mapped_type = "date"
                                 elif "bool" in col_type: mapped_type = "boolean"
                                 
@@ -628,7 +139,9 @@ def extract_calculations(root: ET.Element) -> List[Dict[str, Any]]:
             seen.add(clean_name)
 
             table_calc_node = col.find(".//table-calc")
-            table_calc_def = {k: v for k, v in table_calc_node.attrib.items()} if table_calc_node is not None else None
+            table_calc_def = None
+            if table_calc_node is not None:
+                table_calc_def = {k: v for k, v in table_calc_node.attrib.items()}
 
             calculations.append({
                 "calculationId": clean(calc_id),
@@ -727,133 +240,19 @@ def extract_relationships(root: ET.Element, valid_tables: dict, local_name_map: 
     return relationships
 
 # ============================================================
-# STEP 4: VISUAL STRUCTURE CLASSIFICATION ENGINE
+# STEP 4: VISUAL METADATA (Full Extraction)
 # ============================================================
-def resolve_visual_structure(
-    mark_class: str,
-    rows_fields: List[Dict[str, Any]],
-    cols_fields: List[Dict[str, Any]],
-    encodings: List[Dict[str, Any]],
-    pct_total_present: bool,
-    has_boxplot: bool,
-    is_dual_axis: bool,
-    is_combo: bool,
-    rows_str: str,
-    cols_str: str
-) -> Dict[str, Optional[str]]:
-    """
-    For Bar Charts: visualType = detailed subtype name, visualSubtype = None.
-    For other visuals: visualType = standard base visualType, visualSubtype = None.
-    """
-    rows_dims = [f for f in rows_fields if f["role"] == "dimension"]
-    rows_meas = [f for f in rows_fields if f["role"] == "measure"]
-    cols_dims = [f for f in cols_fields if f["role"] == "dimension"]
-    cols_meas = [f for f in cols_fields if f["role"] == "measure"]
-
-    color_enc = [e for e in encodings if e.get("encoding") == "color"]
-    size_enc = [e for e in encodings if e.get("encoding") == "size"]
-    wedge_enc = [e for e in encodings if e.get("encoding") == "wedge-size"]
-    has_color_dim = any(e.get("isDimension") for e in color_enc)
-
-    # 1. PIE & DONUT CHARTS
-    if mark_class == "pie" or len(wedge_enc) > 0:
-        has_dummy_axis = bool(re.search(r'\b(min|avg|sum)\s*\(\s*0\s*\)', (rows_str + cols_str).lower()))
-        if is_dual_axis or has_dummy_axis:
-            return {"visualType": "Donut Chart", "visualSubtype": None}
-        return {"visualType": "Pie Chart", "visualSubtype": None}
-
-    # 2. SINGLE-VALUE KPI / CARD
-    if not rows_fields and not cols_fields and any(e["role"] == "text" for e in encodings):
-        return {"visualType": "Card", "visualSubtype": None}
-
-    # 3. BOX & WHISKER PLOT
-    if has_boxplot:
-        return {"visualType": "Box Plot", "visualSubtype": None}
-
-    # 4. COMBO CHART
-    if is_combo:
-        return {"visualType": "Combo Chart", "visualSubtype": None}
-
-    # 5. BAR CHARTS (Subtype becomes the primary visualType)
-    is_bar_layout = (mark_class == "bar") or (
-        mark_class == "automatic" and (
-            (bool(rows_dims) and bool(cols_meas)) or (bool(cols_dims) and bool(rows_meas))
-        )
-    )
-
-    if is_bar_layout:
-        is_ranking = any("rank" in f.get("instanceName", "").lower() or "rank" in f.get("derivation", "").lower() 
-                         for f in (rows_fields + cols_fields))
-        
-        if pct_total_present:
-            chart_name = "100% Stacked Horizontal Bar Chart" if (cols_meas and rows_dims) else "100% Stacked Bar Chart"
-            return {"visualType": chart_name, "visualSubtype": None}
-        if is_ranking:
-            return {"visualType": "Ranking Bar Chart", "visualSubtype": None}
-        if has_color_dim:
-            chart_name = "Stacked Horizontal Bar Chart" if (cols_meas and rows_dims) else "Stacked Bar Chart"
-            return {"visualType": chart_name, "visualSubtype": None}
-        if (cols_meas and len(rows_dims) > 1) or (rows_meas and len(cols_dims) > 1):
-            return {"visualType": "Clustered Bar Chart", "visualSubtype": None}
-        if cols_meas and rows_dims:
-            return {"visualType": "Horizontal Bar Chart", "visualSubtype": None}
-        if rows_meas and cols_dims:
-            return {"visualType": "Vertical Bar Chart", "visualSubtype": None}
-        return {"visualType": "Bar Chart", "visualSubtype": None}
-
-    # 6. LINE CHARTS
-    if mark_class == "line" or (mark_class == "automatic" and any("date" in str(f.get("dataType")).lower() for f in cols_dims)):
-        return {"visualType": "Line Chart", "visualSubtype": None}
-
-    # 7. AREA CHARTS
-    if mark_class == "area":
-        return {"visualType": "Area Chart", "visualSubtype": None}
-
-    # 8. SQUARES / HEATMAP / TREEMAP
-    if mark_class == "square":
-        if size_enc and not rows_fields and not cols_fields:
-            return {"visualType": "Treemap", "visualSubtype": None}
-        return {"visualType": "Heat Map", "visualSubtype": None}
-
-    # 9. CIRCLE / SCATTER / BUBBLE
-    if mark_class in ["circle", "scatter"]:
-        if size_enc and not rows_fields and not cols_fields:
-            return {"visualType": "Packed Bubble Chart", "visualSubtype": None}
-        return {"visualType": "Scatter Plot", "visualSubtype": None}
-
-    # 10. GANTT / WATERFALL
-    if mark_class == "ganttbar":
-        if size_enc:
-            return {"visualType": "Waterfall Chart", "visualSubtype": None}
-        return {"visualType": "Gantt Chart", "visualSubtype": None}
-
-    # 11. MAPS
-    if mark_class in ["map", "multipolygon", "filledmap", "polygon"]:
-        return {"visualType": "Map", "visualSubtype": None}
-
-    # 12. TEXT TABLES
-    if mark_class == "text":
-        return {"visualType": "Text Table", "visualSubtype": None}
-
-    # Fallback
-    base_type = MARK_MAP.get(mark_class, 'Standard Visual')
-    return {"visualType": base_type, "visualSubtype": None}
-
-# ============================================================
-# STEP 5: VISUAL METADATA EXTRACTION
-# ============================================================
-def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], calculations_list: List[Dict[str, Any]], column_datatypes: Dict[str, str] = None):
+def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], calculations_list: List[Dict[str, Any]]):
     worksheets_data = []
     dashboards_data = []
     calc_lookup = {c["calculationId"]: c for c in calculations_list}
     calc_name_lookup = {c["name"]: c for c in calculations_list}
-    column_datatypes = column_datatypes or {}
 
     # --- A. Worksheets Extraction ---
     for ws in root.findall(".//worksheet"):
         sheet_name = ws.get('name')
         
-        # Title extraction
+        # Title logic
         title_run = ws.find(".//title/formatted-text/run")
         raw_title = title_run.text if (title_run is not None and title_run.text) else "<Sheet Name>"
         display_title = sheet_name if "<Sheet Name>" in raw_title else raw_title.replace("\n", " ").strip()
@@ -862,33 +261,17 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
         rows_str = ws.findtext(".//rows", default="")
         cols_str = ws.findtext(".//cols", default="")
 
-        # Panes & Mark classes
-        panes = ws.findall(".//pane")
-        pane_marks = []
-        for p in panes:
-            m = p.find("mark")
-            if m is not None:
-                pane_marks.append(m.get("class", "automatic").lower())
+        # Determine visual mark type
+        mark_elem = ws.find(".//pane/mark")
+        mark_class = mark_elem.get('class', 'automatic').lower() if mark_elem is not None else 'automatic'
+        visual_type = MARK_MAP.get(mark_class, 'Bar Chart')
 
-        mark_class = pane_marks[0] if pane_marks else "automatic"
-        distinct_pane_marks = set(pane_marks)
-
-        dual_axis_shelf_hint = bool(re.search(r'\)\s*\+\s*\w+\(', rows_str)) or bool(re.search(r'\)\s*\+\s*\w+\(', cols_str))
-        is_combo = len(panes) > 1 and len(distinct_pane_marks) > 1
-        is_dual_axis = (len(panes) > 1 and len(distinct_pane_marks) <= 1) or (dual_axis_shelf_hint and not is_combo)
-
-        has_boxplot = any(
-            "box" in str(v).lower()
-            for ref in ws.findall(".//reference-line") + ws.findall(".//reference-band") + ws.findall(".//statistic")
-            for v in ref.attrib.values()
-        )
-
+        # Columns, Encoded Fields, Filters, and Table Calculations
         fields = []
         encodings = []
         filters = []
         table_calcs = []
         columns_ref = []
-        pct_from_derivations = False
 
         # 1. Dependency Analysis
         for dep in ws.findall(".//datasource-dependencies"):
@@ -899,15 +282,14 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
                 derivation = col_inst.get("derivation", "None")
                 inst_type = col_inst.get("type", "nominal")
                 
-                if derivation.lower() in PCT_TOTAL_INDICATORS or inst_name.lower().startswith("pcto:"):
-                    pct_from_derivations = True
-
+                # Calculation resolution
                 calc_meta = calc_lookup.get(clean(raw_col)) or calc_name_lookup.get(clean_col)
                 is_calc = calc_meta is not None
                 
                 field_role = "dimension" if inst_type in ["nominal", "ordinal"] else "measure"
                 field_table = None if is_calc else column_to_table.get(clean_col, "Unknown")
                 
+                # Check shelf presence
                 shelf_location = "Marks"
                 if inst_name in rows_str: shelf_location = "Rows"
                 elif inst_name in cols_str: shelf_location = "Columns"
@@ -917,7 +299,7 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
                     "role": field_role,
                     "table": field_table,
                     "column": clean_col,
-                    "dataType": calc_meta["dataType"] if is_calc else column_datatypes.get(clean_col, "string"),
+                    "dataType": calc_meta["dataType"] if is_calc else "string",
                     "name": calc_meta["name"] if is_calc else clean_col,
                     "instanceName": inst_name,
                     "derivation": derivation,
@@ -931,14 +313,6 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
                     if calc_meta.get("defaultFormat"):
                         field_obj["defaultFormat"] = calc_meta["defaultFormat"]
 
-                    tcd = calc_meta.get("tableCalculationDefinition")
-                    if tcd:
-                        table_calcs.append({
-                            "field": field_obj["name"],
-                            "shelf": shelf_location,
-                            "definition": tcd
-                        })
-
                 fields.append(field_obj)
                 columns_ref.append({
                     "table": field_table,
@@ -946,11 +320,6 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
                     "fieldType": field_obj["fieldType"],
                     "calculationId": field_obj.get("calculationId")
                 })
-
-        pct_total_present = pct_from_derivations or any(
-            str(tc["definition"].get("type", "")).replace("_", "").replace("-", "").lower() in PCT_TOTAL_INDICATORS
-            for tc in table_calcs
-        )
 
         # 2. Panes & Encodings
         for pane in ws.findall(".//pane"):
@@ -972,10 +341,6 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
                         enc_obj["calculationId"] = calc_m["calculationId"]
                         enc_obj["dataType"] = calc_m["dataType"]
                         enc_obj["formula"] = calc_m["formula"]
-                        enc_obj["isDimension"] = calc_m.get("role", "measure") == "dimension"
-                    else:
-                        enc_obj["dataType"] = column_datatypes.get(clean_c, "string")
-                        enc_obj["isDimension"] = default_role_for_datatype(enc_obj["dataType"]) == "dimension"
                     encodings.append(enc_obj)
 
         # 3. Filters
@@ -992,27 +357,16 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
                 "instanceName": flt_col
             })
 
-        rows_fields = [f for f in fields if f["shelf"] == "Rows"]
-        cols_fields = [f for f in fields if f["shelf"] == "Columns"]
-
-        # Classification
-        structure = resolve_visual_structure(
-            mark_class=mark_class,
-            rows_fields=rows_fields,
-            cols_fields=cols_fields,
-            encodings=encodings,
-            pct_total_present=pct_total_present,
-            has_boxplot=has_boxplot,
-            is_dual_axis=is_dual_axis,
-            is_combo=is_combo,
-            rows_str=rows_str,
-            cols_str=cols_str
-        )
+        # Fallback card type detection
+        if visual_type == "Standard Visual":
+            if len(cols_str) == 0 and len(rows_str) == 0 and any(e["role"] == "text" for e in encodings):
+                visual_type = "Card"
+            else:
+                visual_type = "Bar Chart"
 
         worksheets_data.append({
             "name": sheet_name,
-            "visualType": structure["visualType"],
-            "visualSubtype": structure["visualSubtype"],
+            "visualType": visual_type,
             "title": {
                 "text": raw_title,
                 "displayText": display_title,
@@ -1021,14 +375,14 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
             },
             "columns": columns_ref,
             "fields": fields,
-            "rows": rows_fields,
-            "columnsShelf": cols_fields,
+            "rows": [f for f in fields if f["shelf"] == "Rows"],
+            "columnsShelf": [f for f in fields if f["shelf"] == "Columns"],
             "encodings": encodings,
             "filters": filters,
             "tableCalculations": table_calcs
         })
 
-    # --- B. Dashboards & Geometry Normalization (Deduplicated) ---
+    # --- B. Dashboards & Geometry Normalization ---
     for db in root.findall(".//dashboard"):
         db_name = db.get("name", "Dashboard")
         size_node = db.find(".//size")
@@ -1037,25 +391,15 @@ def extract_visual_metadata(root: ET.Element, column_to_table: Dict[str, str], c
 
         ws_list = []
         visuals = []
-        seen_visuals = set()
 
         for zone in db.findall(".//zone[@name]"):
             z_name = zone.get("name")
-            if not z_name or zone.get("type-v2") in ["color", "filter", "title", "text"]:
-                continue
+            ws_list.append(z_name)
 
             raw_x = float(zone.get("x", 0))
             raw_y = float(zone.get("y", 0))
             raw_w = float(zone.get("w", 0))
             raw_h = float(zone.get("h", 0))
-
-            zone_key = (z_name, raw_x, raw_y, raw_w, raw_h)
-            if zone_key in seen_visuals:
-                continue
-            seen_visuals.add(zone_key)
-
-            if z_name not in ws_list:
-                ws_list.append(z_name)
 
             visuals.append({
                 "name": z_name,
@@ -1103,11 +447,15 @@ def extract_metadata_from_twbx(twbx_path: str):
         root = tree.getroot()
         strip_ns(root)
 
+        # 1. Calculations
         calculations = extract_calculations(root)
+
+        # 2. Tables & Physical Schema
         xml_tables, local_name_map = extract_xml_metadata(root)
         hyper_tables = extract_hyper_metadata(hyper) if hyper else {}
 
         final_tables = {}
+        # Merge XML + Hyper
         for t, cols in xml_tables.items():
             if not is_junk_table(t):
                 final_tables[t] = cols
@@ -1115,16 +463,17 @@ def extract_metadata_from_twbx(twbx_path: str):
             if not is_junk_table(t) and t not in final_tables:
                 final_tables[t] = cols
 
+        # 3. Relationships
         relationships = extract_relationships(root, final_tables, local_name_map)
 
+        # 4. Inverted Column-to-Table Map
         column_to_table = {}
-        column_datatypes = {}
         for tbl, cols in final_tables.items():
             for c in cols:
                 column_to_table[c["name"]] = tbl
-                column_datatypes.setdefault(c["name"], c["dataType"])
 
-        worksheets, dashboards = extract_visual_metadata(root, column_to_table, calculations, column_datatypes)
+        # 5. Worksheets & Dashboards
+        worksheets, dashboards = extract_visual_metadata(root, column_to_table, calculations)
 
         return {
             "tables": final_tables,
