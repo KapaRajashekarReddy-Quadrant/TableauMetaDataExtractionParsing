@@ -534,10 +534,6 @@ def default_role_for_datatype(dtype: str) -> str:
         return "measure"
     return "dimension"
 
-# Matches common Tableau geographic field captions/roles
-# (e.g. "Latitude (generated)", "[Longitude]", custom Geometry fields).
-GEO_NAME_PATTERN = re.compile(r'(latitude|longitude|geometry|geo\s*coding|\bgeo\b)', re.IGNORECASE)
-
 # Quick table-calc "type" values that represent a percent-of-total calc.
 # Tableau's own attribute spelling varies by version, so we match loosely.
 PCT_TOTAL_TYPES = {"pcttotal", "percentoftotal", "percent_of_total"}
@@ -759,25 +755,16 @@ def resolve_chart_subtype(
     table calculations (e.g. Percent of Total) or multiple panes
     (dual-axis/combo) are present.
 
-    This is intentionally separate from the base "visualType" (which is
-    just MARK_MAP[mark_class]). It returns None when the worksheet is a
-    plain/default rendering of its mark class with nothing extra worth
-    surfacing - only worksheets whose shelf/encoding combination changes
-    how the visual needs to be rebuilt in Power BI (stacked vs. clustered
-    bars, dual-axis vs. combo lines, donut vs. pie, filled vs. symbol map,
-    treemap vs. heatmap, bubble vs. scatter, box-and-whisker overlays,
-    etc.) get a non-null subtype. Callers should only surface
-    "visualSubtype" in the output when this returns a value.
+    Subtype detection is scoped to BAR charts only. Every other mark class
+    (line, area, pie, circle/scatter/shape, square, map, text, ...) keeps
+    its plain base "visualType" from MARK_MAP with no subtype - this
+    function returns None for all of them unconditionally, regardless of
+    dual-axis/combo/donut/geo/etc. signals. Callers should only surface
+    "visualSubtype" in the output when this returns a non-null value.
     """
 
-    def is_continuous(f: Dict[str, Any]) -> bool:
-        return f.get("instanceType") == "quantitative"
-
-    def is_date_type(f: Dict[str, Any]) -> bool:
-        return f.get("dataType") in ("date", "datetime")
-
-    def looks_geo(name: str) -> bool:
-        return bool(name) and bool(GEO_NAME_PATTERN.search(name))
+    if mark_class != "bar":
+        return None
 
     rows_dims = [f for f in rows_fields if f["role"] == "dimension"]
     rows_meas = [f for f in rows_fields if f["role"] == "measure"]
@@ -785,108 +772,24 @@ def resolve_chart_subtype(
     cols_meas = [f for f in cols_fields if f["role"] == "measure"]
 
     color_lod_dims = [e for e in encodings if e.get("encoding") in ("color", "lod") and e.get("isDimension")]
-    color_meas = [e for e in encodings if e.get("encoding") == "color" and not e.get("isDimension")]
-    size_encodings = [e for e in encodings if e.get("encoding") == "size"]
-    size_meas = [e for e in size_encodings if not e.get("isDimension")]
 
-    # Geographic role: any field on Rows/Cols/encodings named like a
-    # lat/long/geometry field marks this as a map, regardless of mark.
-    all_field_names = (
-        [f.get("name", "") for f in rows_fields + cols_fields]
-        + [e.get("name", "") for e in encodings]
-    )
-    has_geo_fields = any(looks_geo(n) for n in all_field_names)
-
-    # Box-and-whisker overlays win regardless of the underlying mark type.
-    if has_boxplot:
-        return "Box-and-Whisker Plot"
-
-    if has_geo_fields:
-        if mark_class in ("multipolygon", "polygon", "filledmap"):
-            return "Filled Map"
-        if mark_class in ("circle", "shape", "automatic", "map"):
-            return "Symbol Map"
-
-    if mark_class in ("multipolygon", "polygon", "filledmap"):
-        return "Filled Map"
-    if mark_class == "map":
-        # Plain map mark - identical to the base "Map" visualType, so no
-        # extra subtype is needed.
-        return None
-
-    if mark_class == "bar":
-        if is_combo:
-            return "Combo Chart (Line + Bar)"
-        if pct_total_present:
-            return "100% Stacked Bar Chart"
-        if color_lod_dims:
-            return "Stacked Bar Chart"
-        # Clustered/side-by-side: more than one dimension sharing the
-        # shelf opposite the measure (nested pills next to the measure).
-        if cols_meas and len(rows_dims) > 1:
-            return "Clustered / Side-by-Side Bar Chart"
-        if rows_meas and len(cols_dims) > 1:
-            return "Clustered / Side-by-Side Bar Chart"
-        if cols_meas and rows_dims:
-            return "Horizontal Bar Chart"
-        if rows_meas and cols_dims:
-            return "Vertical Bar Chart"
-        # Plain single-measure bar - same as the base "Bar Chart" type.
-        return None
-
-    if mark_class == "line":
-        if is_combo:
-            return "Combo Chart (Line + Bar)"
-        if is_dual_axis:
-            return "Dual Axis Line Chart"
-        if color_lod_dims:
-            return "Multi-Line Chart"
-        if any(is_continuous(f) and is_date_type(f) for f in rows_fields + cols_fields):
-            return "Trend Line / Time Series Line"
-        # Plain single-series line - same as the base "Line Chart" type.
-        return None
-
-    if mark_class == "area":
-        if pct_total_present:
-            return "100% Stacked Area Chart"
-        if color_lod_dims:
-            return "Stacked Area Chart"
-        # Plain single-series area - same as the base "Area Chart" type.
-        return None
-
-    if mark_class in ("circle", "shape", "scatter"):
-        cols_meas_cont = [f for f in cols_meas if is_continuous(f)]
-        rows_meas_cont = [f for f in rows_meas if is_continuous(f)]
-        if cols_meas_cont and rows_meas_cont and size_encodings:
-            return "Bubble Chart"
-        # Plain scatter/shape mark - same as the base type (Scatter Plot /
-        # Shape Chart), no extra subtype needed.
-        return None
-
-    if mark_class == "square":
-        if size_meas and color_meas:
-            return "Treemap"
-        if color_meas:
-            return "Heatmap (Highlight Table)"
-        # Plain square mark - same as the base "Heat Map" type.
-        return None
-
-    if mark_class in ("text", "automatic"):
-        if color_meas:
-            return "Heatmap (Highlight Table)"
-        # Plain text/crosstab - same as the base type, no subtype needed.
-        return None
-
-    if mark_class == "pie":
-        # A pie built as a donut is authored as a dual-axis/second-pane
-        # view (a plain white "hole" circle overlaid on the pie axis).
-        if is_dual_axis or is_combo:
-            return "Donut Chart"
-        # Plain pie - same as the base "Pie Chart" type.
-        return None
-
-    # Gantt bars and any other mark classes have no finer-grained subtype
-    # distinction beyond MARK_MAP's base visualType.
+    if is_combo:
+        return "Combo Chart (Line + Bar)"
+    if pct_total_present:
+        return "100% Stacked Bar Chart"
+    if color_lod_dims:
+        return "Stacked Bar Chart"
+    # Clustered/side-by-side: more than one dimension sharing the
+    # shelf opposite the measure (nested pills next to the measure).
+    if cols_meas and len(rows_dims) > 1:
+        return "Clustered / Side-by-Side Bar Chart"
+    if rows_meas and len(cols_dims) > 1:
+        return "Clustered / Side-by-Side Bar Chart"
+    if cols_meas and rows_dims:
+        return "Horizontal Bar Chart"
+    if rows_meas and cols_dims:
+        return "Vertical Bar Chart"
+    # Plain single-measure bar - same as the base "Bar Chart" type.
     return None
 
 
