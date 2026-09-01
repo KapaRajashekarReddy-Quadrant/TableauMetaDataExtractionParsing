@@ -157,6 +157,31 @@ def extract_calculations(root: ET.Element) -> List[Dict[str, Any]]:
     return calculations
 
 # ============================================================
+# STEP 2b: DATASOURCE NAME
+# ============================================================
+def extract_datasource_name(root: ET.Element) -> str | None:
+    """
+    Returns the human-readable datasource caption (e.g. 'Manufacturing_Analysis'),
+    skipping pseudo-datasources like Tableau's built-in 'Parameters' datasource
+    (identified by having no <connection> child).
+    """
+    datasources_el = root.find("datasources")
+    if datasources_el is None:
+        return None
+
+    for ds in datasources_el.findall("datasource"):
+        if ds.find("connection") is None:
+            continue  # skip Parameters / connectionless pseudo-datasources
+        caption = ds.get("caption")
+        if caption:
+            return clean(caption)
+        name = ds.get("name")
+        if name:
+            return clean(name)  # fallback if caption is missing
+
+    return None
+
+# ============================================================
 # STEP 3: XML METADATA & RELATIONSHIPS
 # ============================================================
 def extract_xml_metadata(root: ET.Element):
@@ -450,6 +475,9 @@ def extract_metadata_from_twbx(twbx_path: str):
         # 1. Calculations
         calculations = extract_calculations(root)
 
+        # 1b. Datasource name
+        datasource_name = extract_datasource_name(root)
+
         # 2. Tables & Physical Schema
         xml_tables, local_name_map = extract_xml_metadata(root)
         hyper_tables = extract_hyper_metadata(hyper) if hyper else {}
@@ -476,6 +504,7 @@ def extract_metadata_from_twbx(twbx_path: str):
         worksheets, dashboards = extract_visual_metadata(root, column_to_table, calculations)
 
         return {
+            "datasourceName": datasource_name,
             "tables": final_tables,
             "relationships": relationships,
             "calculations": calculations,
