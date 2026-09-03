@@ -14,8 +14,9 @@ from dotenv import load_dotenv
 
 # Import the complete updated extractor
 from extractor import extract_metadata_from_twbx
+from kpi_suggestions import apply_kpi_suggestions_to_metadata
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 
 # ============================================================
@@ -64,6 +65,10 @@ class SemanticModelRequest(BaseModel):
     relationships: List[Relationship]
     clone_report: bool = False
     report_name: Optional[str] = "Final_Manufacturing_Report"
+
+class KpiSuggestion(BaseModel):
+    remap: dict[str, str] = Field(default_factory=dict)
+    remove: list[str] = Field(default_factory=list)
 
 # ============================================================
 # HELPERS
@@ -125,22 +130,54 @@ def upload_json_to_blob(data: dict, filename: str) -> str:
 # ============================================================
 # API: EXTRACT METADATA & VISUALS PERFECTLY
 # ============================================================
+# @app.post("/extract-metadata")
+# def extract_metadata(folder_name: str):
+#     try:
+#         file_path = download_file_from_blob(folder_name)
+#         metadata = extract_metadata_from_twbx(file_path)
+        
+#         if os.path.exists(file_path):
+#             os.remove(file_path)
+        
+#         output_filename = f"{folder_name}_metadata.json"
+#         blob_url = upload_json_to_blob(metadata, output_filename)
+        
+#         return {
+#             "status": "SUCCESS", 
+#             "metadata": metadata,
+#             "outputBlobUrl": blob_url
+#         }
+#     except Exception as e:
+#         log.exception("Metadata extraction failed")
+#         raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/extract-metadata")
-def extract_metadata(folder_name: str):
+def extract_metadata(
+    folder_name: str,
+    suggestions: Optional[KpiSuggestion] = None,
+):
     try:
         file_path = download_file_from_blob(folder_name)
         metadata = extract_metadata_from_twbx(file_path)
-        
+
         if os.path.exists(file_path):
             os.remove(file_path)
-        
+
+        # Migrate-with-suggestions: remap visual KPI names
+        if suggestions and (suggestions.remap or suggestions.remove):
+            metadata = apply_kpi_suggestions_to_metadata(
+                metadata,
+                remap=suggestions.remap,
+                remove=suggestions.remove,
+            )
+
         output_filename = f"{folder_name}_metadata.json"
         blob_url = upload_json_to_blob(metadata, output_filename)
-        
+
         return {
-            "status": "SUCCESS", 
+            "status": "SUCCESS",
             "metadata": metadata,
-            "outputBlobUrl": blob_url
+            "outputBlobUrl": blob_url,
         }
     except Exception as e:
         log.exception("Metadata extraction failed")
